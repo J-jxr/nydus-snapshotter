@@ -10,368 +10,131 @@
 package converter
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
 	"github.com/containerd/containerd/v2/core/images/converter"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
+	"github.com/klauspost/compress/zstd"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/errgroup"
 )
 
 // ConvertFunc returns a converted content descriptor.
 // When the content was not converted, ConvertFunc returns nil.
 type ConvertFunc = converter.ConvertFunc
 
-// DefaultIndexConvertFunc is the default convert func used by Convert.
+// DefaultIndexConvertFunc wraps the upstream default converter and adds Nydus-specific post processing.
 func DefaultIndexConvertFunc(layerConvertFunc ConvertFunc, docker2oci bool, platformMC platforms.MatchComparer) ConvertFunc {
-	c := &defaultConverter{
-		layerConvertFunc: layerConvertFunc,
-		docker2oci:       docker2oci,
-		platformMC:       platformMC,
-		ocilayerMap:      make(map[string]bool),
-		diffIDMap:        make(map[digest.Digest]digest.Digest),
-	}
-	return c.convert
-}
-
-type defaultConverter struct {
-	layerConvertFunc ConvertFunc
-	docker2oci       bool
-	platformMC       platforms.MatchComparer
-	diffIDMap        map[digest.Digest]digest.Digest // key: old diffID, value: new diffID
-	ocilayerMap      map[string]bool                 // key: oci layer digest, value: true
-	diffIDMapMu      sync.RWMutex
-	ocilayerMapMu    sync.RWMutex
-}
-
-// convert dispatches desc.MediaType and calls c.convert{Layer,Manifest,Index,Config}.
-//
-// Also converts media type if c.docker2oci is set.
-func (c *defaultConverter) convert(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
-	var (
-		newDesc *ocispec.Descriptor
-		err     error
-	)
-
-	switch {
-	case images.IsLayerType(desc.MediaType):
-		logrus.Debugf("case convert layer %s", desc.Digest.String())
-		newDesc, err = c.convertLayer(ctx, cs, desc)
-	case images.IsManifestType(desc.MediaType):
-		logrus.Debugf("case convert manifest %s", desc.Digest.String())
-		newDesc, err = c.convertManifest(ctx, cs, desc)
-	case images.IsIndexType(desc.MediaType):
-		logrus.Debugf("case convert index %s", desc.Digest.String())
-		newDesc, err = c.convertIndex(ctx, cs, desc)
-	case images.IsConfigType(desc.MediaType):
-		logrus.Debugf("case convert config %s", desc.Digest.String())
-		newDesc, err = c.convertConfig(ctx, cs, desc)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if images.IsDockerType(desc.MediaType) {
-		if c.docker2oci {
-			if newDesc == nil {
-				newDesc = copyDesc(desc)
-			}
-			newDesc.MediaType = ConvertDockerMediaTypeToOCI(newDesc.MediaType)
-		} else if (newDesc == nil && len(desc.Annotations) != 0) || (newDesc != nil && len(newDesc.Annotations) != 0) {
-			// Annotations is supported only on OCI manifest.
-			// We need to remove annotations for Docker media types.
-			if newDesc == nil {
-				newDesc = copyDesc(desc)
-			}
-			// newDesc.Annotations = nil
-		}
-	}
-	logrus.WithField("old", desc).WithField("new", newDesc).Debugf("converted")
-	return newDesc, nil
-}
-
-func copyDesc(desc ocispec.Descriptor) *ocispec.Descriptor {
-	descCopy := desc
-	return &descCopy
-}
-
-// convertLayer converts image layers if c.layerConvertFunc is set.
-//
-// c.layerConvertFunc can be nil, e.g., for converting Docker media types to OCI ones.
-func (c *defaultConverter) convertLayer(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
-	if c.layerConvertFunc != nil {
-		return c.layerConvertFunc(ctx, cs, desc)
-	}
-	// No conversion needed - returning nil descriptor with nil error is the correct pattern here
-	//nolint:nilnil
-	return nil, nil
-}
-
-// convertManifest converts image manifests.
-//
-// - converts `.mediaType` if the target format is OCI
-// - records diff ID changes in c.diffIDMap
-func (c *defaultConverter) convertManifest(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
-	var (
-		manifest ocispec.Manifest
-		modified bool
-	)
-	labels, err := readJSON(ctx, cs, &manifest, desc)
-	if err != nil {
-		return nil, err
-	}
-
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	if images.IsDockerType(manifest.MediaType) && c.docker2oci {
-		manifest.MediaType = ConvertDockerMediaTypeToOCI(manifest.MediaType)
-		modified = true
-	}
-	var mu sync.Mutex
-	eg, ctx2 := errgroup.WithContext(ctx)
-	for i, l := range manifest.Layers {
-		i := i
-		l := l
-		// get digest id
-		oldDiffID := l.Digest
-		eg.Go(func() error {
-			newL, err := c.convert(ctx2, cs, l)
-			if err != nil {
-				return err
-			}
-			if newL != nil && IsNydusBootstrap(*newL) {
-				// delete nydus bootstrap layer
-				mu.Lock()
-				ClearGCLabels(labels, newL.Digest)
-				manifest.Layers = slices.Delete(manifest.Layers, i, i+1)
-				modified = true
-				mu.Unlock()
-			} else if newL != nil {
-				mu.Lock()
-				// update GC labels
-				ClearGCLabels(labels, l.Digest)
-				labelKey := fmt.Sprintf("containerd.io/gc.ref.content.l.%d", i)
-				labels[labelKey] = newL.Digest.String()
-				manifest.Layers[i] = *newL
-				modified = true
-				mu.Unlock()
-
-				// diffID changes if the tar entries were modified.
-				// diffID stays same if only the compression type was changed.
-				// When diffID changed, add a map entry so that we can update image config.
-				newDiffID := newL.Digest
-				if uncompress, ok := newL.Annotations[LayerAnnotationUncompressed]; ok {
-					newDiffID = digest.Digest(uncompress)
-				}
-				if newDiffID != oldDiffID {
-					c.diffIDMapMu.Lock()
-					c.diffIDMap[oldDiffID] = newDiffID
-					c.diffIDMapMu.Unlock()
-				}
-				c.ocilayerMapMu.Lock()
-				c.ocilayerMap[newL.Digest.String()] = true
-				c.ocilayerMapMu.Unlock()
-			}
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
-
-	newConfig, err := c.convert(ctx, cs, manifest.Config)
-	if err != nil {
-		return nil, err
-	}
-	if newConfig != nil {
-		ClearGCLabels(labels, manifest.Config.Digest)
-		labels["containerd.io/gc.ref.content.config"] = newConfig.Digest.String()
-		manifest.Config = *newConfig
-		modified = true
-	}
-
-	if modified {
-		return writeJSON(ctx, cs, &manifest, desc, labels)
-	}
-	// No modification needed - returning nil descriptor with nil error is the correct pattern here
-	//nolint:nilnil
-	return nil, nil
-}
-
-// convertIndex converts image index.
-//
-// - converts `.mediaType` if the target format is OCI
-// - clears manifest entries that do not match c.platformMC
-func (c *defaultConverter) convertIndex(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
-	var (
-		index    ocispec.Index
-		modified bool
-	)
-	labels, err := readJSON(ctx, cs, &index, desc)
-	if err != nil {
-		return nil, err
-	}
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	if images.IsDockerType(index.MediaType) && c.docker2oci {
-		index.MediaType = ConvertDockerMediaTypeToOCI(index.MediaType)
-		modified = true
-	}
-
-	newManifests := make([]ocispec.Descriptor, len(index.Manifests))
-	newManifestsToBeRemoved := make(map[int]struct{}) // slice index
-	var mu sync.Mutex
-	eg, ctx2 := errgroup.WithContext(ctx)
-	for i, mani := range index.Manifests {
-		i := i
-		mani := mani
-		labelKey := fmt.Sprintf("containerd.io/gc.ref.content.m.%d", i)
-		eg.Go(func() error {
-			if mani.Platform != nil && !c.platformMC.Match(*mani.Platform) {
-				mu.Lock()
-				ClearGCLabels(labels, mani.Digest)
-				newManifestsToBeRemoved[i] = struct{}{}
-				modified = true
-				mu.Unlock()
-				return nil
-			}
-			newMani, err := c.convert(ctx2, cs, mani)
-			if err != nil {
-				return err
-			}
-			mu.Lock()
-			if newMani != nil {
-				ClearGCLabels(labels, mani.Digest)
-				labels[labelKey] = newMani.Digest.String()
-				// NOTE: for keeping manifest order, we specify `i` index explicitly
-				newManifests[i] = *newMani
-				modified = true
-			} else {
-				newManifests[i] = mani
-			}
-			mu.Unlock()
-			return nil
-		})
-	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
-	}
-	if modified {
-		var newManifestsClean []ocispec.Descriptor
-		for i, m := range newManifests {
-			if _, ok := newManifestsToBeRemoved[i]; !ok {
-				newManifestsClean = append(newManifestsClean, m)
-			}
-		}
-		index.Manifests = newManifestsClean
-		return writeJSON(ctx, cs, &index, desc, labels)
-	}
-	// No modification needed - returning nil descriptor with nil error is the correct pattern here
-	//nolint:nilnil
-	return nil, nil
-}
-
-// convertConfig converts image config contents.
-//
-// - updates `.rootfs.diff_ids` using c.diffIDMap .
-//
-// - clears legacy `.config.Image` and `.container_config.Image` fields if `.rootfs.diff_ids` was updated.
-func (c *defaultConverter) convertConfig(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
-	var (
-		cfg      DualConfig
-		cfgAsOCI ocispec.Image // read only, used for parsing cfg
-		modified bool
-	)
-
-	labels, err := readJSON(ctx, cs, &cfg, desc)
-	if err != nil {
-		return nil, err
-	}
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	if _, err := readJSON(ctx, cs, &cfgAsOCI, desc); err != nil {
-		return nil, err
-	}
-
-	if rootfs := cfgAsOCI.RootFS; rootfs.Type == "layers" {
-		rootfsModified := false
-		c.diffIDMapMu.RLock()
-		c.ocilayerMapMu.RLock()
-		for i, oldDiffID := range rootfs.DiffIDs {
-			if newDiffID, ok := c.diffIDMap[oldDiffID]; ok && newDiffID != oldDiffID {
-				rootfs.DiffIDs[i] = newDiffID
-				rootfsModified = true
-			} else if _, ok := c.ocilayerMap[oldDiffID.String()]; !ok {
-				logrus.Debugf("remove diffid: %s", oldDiffID.String())
-				rootfs.DiffIDs = slices.Delete(rootfs.DiffIDs, i, i+1)
-			}
-		}
-		c.ocilayerMapMu.RUnlock()
-		c.diffIDMapMu.RUnlock()
-		if rootfsModified {
-			rootfsB, err := json.Marshal(rootfs)
-			if err != nil {
-				return nil, err
-			}
-			cfg["rootfs"] = (*json.RawMessage)(&rootfsB)
-			modified = true
-		}
-	}
-
-	for i, h := range cfgAsOCI.History {
-		if h.Comment == "Nydus Bootstrap Layer" && h.CreatedBy == "Nydus Converter" {
-			// Remove the history entry of nydus bootstrap layer.
-			// We don't need to convert nydus bootstrap layer.
-			cfgAsOCI.History = slices.Delete(cfgAsOCI.History, i, i+1)
-			modified = true
-			break
-		}
-	}
-
-	for i, h := range cfgAsOCI.History {
-		if h.EmptyLayer {
-			// Remove the history entry of empty layer.
-			cfgAsOCI.History = slices.Delete(cfgAsOCI.History, i, i+1)
-			modified = true
-			continue
-		}
-	}
-
-	// Handle excessive non-empty layers in History section
-	if len(cfgAsOCI.RootFS.DiffIDs) < len(cfgAsOCI.History) {
-		cfgAsOCI.History = []ocispec.History{}
-	}
-
-	if modified {
-		// Process history changes
-		historyJSON, err := json.Marshal(cfgAsOCI.History)
+	upstream := converter.DefaultIndexConvertFunc(layerConvertFunc, docker2oci, platformMC)
+	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
+		dst, err := upstream(ctx, cs, desc)
 		if err != nil {
 			return nil, err
 		}
-		cfg["history"] = (*json.RawMessage)(&historyJSON)
-
-		// cfg may have dummy value for legacy `.config.Image` and `.container_config.Image`
-		// We should clear the ID if we changed the diff IDs.
-		if _, err := clearDockerV1DummyID(cfg); err != nil {
-			return nil, err
+		if dst == nil {
+			return nil, nil
 		}
-		return writeJSON(ctx, cs, &cfg, desc, labels)
+
+		if images.IsManifestType(dst.MediaType) {
+			var manifest ocispec.Manifest
+			labels, err := readJSON(ctx, cs, &manifest, *dst)
+			if err != nil {
+				return nil, err
+			}
+			if labels == nil {
+				labels = make(map[string]string)
+			}
+
+			// Remove nydus bootstrap layer if present
+			newLayers := make([]ocispec.Descriptor, 0, len(manifest.Layers))
+			for _, l := range manifest.Layers {
+				if IsNydusBootstrap(l) {
+					ClearGCLabels(labels, l.Digest)
+					continue
+				}
+				newLayers = append(newLayers, l)
+			}
+			manifest.Layers = newLayers
+
+			// Update config: rebuild diffIDs from layer annotations and clean history
+			var cfg DualConfig
+			var cfgOCI ocispec.Image
+			cfgLabels, err := readJSON(ctx, cs, &cfg, manifest.Config)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := readJSON(ctx, cs, &cfgOCI, manifest.Config); err != nil {
+				return nil, err
+			}
+
+			var diffIDs []digest.Digest
+			for _, l := range manifest.Layers {
+				if uncompress, ok := l.Annotations[LayerAnnotationUncompressed]; ok {
+					diffIDs = append(diffIDs, digest.Digest(uncompress))
+				} else {
+					diffIDs = append(diffIDs, l.Digest)
+				}
+			}
+			cfgOCI.RootFS.Type = "layers"
+			cfgOCI.RootFS.DiffIDs = diffIDs
+
+			// Remove bootstrap and empty layers from history
+			for i, h := range cfgOCI.History {
+				if h.Comment == "Nydus Bootstrap Layer" && h.CreatedBy == "Nydus Converter" {
+					cfgOCI.History = slices.Delete(cfgOCI.History, i, i+1)
+					break
+				}
+			}
+			for i, h := range cfgOCI.History {
+				if h.EmptyLayer {
+					cfgOCI.History = slices.Delete(cfgOCI.History, i, i+1)
+				}
+			}
+			if len(cfgOCI.RootFS.DiffIDs) < len(cfgOCI.History) {
+				cfgOCI.History = []ocispec.History{}
+			}
+
+			historyJSON, err := json.Marshal(cfgOCI.History)
+			if err != nil {
+				return nil, err
+			}
+			cfg["history"] = (*json.RawMessage)(&historyJSON)
+
+			rootfsJSON, err := json.Marshal(cfgOCI.RootFS)
+			if err != nil {
+				return nil, err
+			}
+			cfg["rootfs"] = (*json.RawMessage)(&rootfsJSON)
+
+			if _, err := clearDockerV1DummyID(cfg); err != nil {
+				return nil, err
+			}
+			newConfig, err := writeJSON(ctx, cs, &cfg, manifest.Config, cfgLabels)
+			if err != nil {
+				return nil, err
+			}
+
+			ClearGCLabels(labels, manifest.Config.Digest)
+			labels["containerd.io/gc.ref.content.config"] = newConfig.Digest.String()
+			manifest.Config = *newConfig
+
+			return writeJSON(ctx, cs, &manifest, *dst, labels)
+		}
+
+		// For index or other types, return upstream result
+		return dst, nil
 	}
-	// No modification needed - returning nil descriptor with nil error is the correct pattern here
-	//nolint:nilnil
-	return nil, nil
 }
 
 // clearDockerV1DummyID clears the dummy values for legacy `.config.Image` and `.container_config.Image`.
@@ -437,5 +200,180 @@ func ClearGCLabels(labels map[string]string, dgst digest.Digest) {
 		if v == dgst.String() && strings.HasPrefix(k, "containerd.io/gc.ref.content") {
 			delete(labels, k)
 		}
+	}
+}
+
+func makeOCIBlobDesc(ctx context.Context, cs content.Store, uncompressedDigest, targetDigest digest.Digest, mediaType string) (*ocispec.Descriptor, error) {
+	targetInfo, err := cs.Info(ctx, targetDigest)
+	if err != nil {
+		return nil, errors.Wrapf(err, "get target blob info %s", targetDigest)
+	}
+	if targetInfo.Labels == nil {
+		targetInfo.Labels = map[string]string{}
+	}
+
+	targetDesc := ocispec.Descriptor{
+		Digest:    targetDigest,
+		Size:      targetInfo.Size,
+		MediaType: mediaType,
+		Annotations: map[string]string{
+			LayerAnnotationUncompressed: uncompressedDigest.String(),
+		},
+	}
+
+	return &targetDesc, nil
+}
+
+func ReconvertHookFunc() converter.ConvertHookFunc {
+	return func(ctx context.Context, cs content.Store, _ ocispec.Descriptor, newDesc *ocispec.Descriptor) (*ocispec.Descriptor, error) {
+		desc := newDesc
+		if !images.IsManifestType(desc.MediaType) {
+			return desc, nil
+		}
+		if IsNydusBootstrap(*desc) {
+			return desc, nil
+		}
+		var err error
+		var labels map[string]string
+		switch desc.MediaType {
+		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+			var manifest ocispec.Manifest
+			labels, err = readJSON(ctx, cs, &manifest, *desc)
+			if err != nil {
+				return nil, errors.Wrap(err, "read manifest")
+			}
+
+			desc, err = writeJSON(ctx, cs, manifest, *desc, labels)
+			if err != nil {
+				return nil, errors.Wrap(err, "write manifest")
+			}
+			return desc, nil
+
+		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+			var index ocispec.Index
+			labels, err = readJSON(ctx, cs, &index, *desc)
+			if err != nil {
+				return nil, errors.Wrap(err, "read manifest index")
+			}
+			for idx, maniDesc := range index.Manifests {
+				var manifest ocispec.Manifest
+				labels, err = readJSON(ctx, cs, &manifest, maniDesc)
+				if err != nil {
+					return nil, errors.Wrap(err, "read manifest")
+				}
+
+				newManiDesc, err := writeJSON(ctx, cs, manifest, maniDesc, labels)
+				if err != nil {
+					return nil, errors.Wrap(err, "write manifest")
+				}
+				index.Manifests[idx] = *newManiDesc
+			}
+			desc, err = writeJSON(ctx, cs, index, *desc, labels)
+			if err != nil {
+				return nil, errors.Wrap(err, "write manifest index")
+			}
+
+			return desc, nil
+
+		default:
+			return nil, errors.Errorf("unsupported media type %s", desc.MediaType)
+		}
+	}
+}
+
+func LayerReconvertFunc(opt UnpackOption) ConvertFunc {
+	return func(ctx context.Context, cs content.Store, desc ocispec.Descriptor) (*ocispec.Descriptor, error) {
+		if !images.IsLayerType(desc.MediaType) {
+			return nil, nil
+		}
+
+		if IsNydusBootstrap(desc) {
+			logrus.Debugf("skip nydus bootstrap layer %s", desc.Digest.String())
+			return &desc, nil
+		}
+
+		ra, err := cs.ReaderAt(ctx, desc)
+		if err != nil {
+			return nil, errors.Wrap(err, "get reader")
+		}
+		defer ra.Close()
+
+		ref := fmt.Sprintf("convert-oci-from-%s", desc.Digest)
+		cw, err := content.OpenWriter(ctx, cs, content.WithRef(ref))
+		if err != nil {
+			return nil, errors.Wrap(err, "open blob writer")
+		}
+		defer cw.Close()
+
+		var gw io.WriteCloser
+		var mediaType string
+		compressor := opt.Compressor
+		if compressor == "" {
+			compressor = "gzip"
+		}
+		switch compressor {
+		case "gzip":
+			gw = gzip.NewWriter(cw)
+			mediaType = ocispec.MediaTypeImageLayerGzip
+		case "zstd":
+			gw, err = zstd.NewWriter(cw)
+			if err != nil {
+				return nil, errors.Wrap(err, "create zstd writer")
+			}
+			mediaType = ocispec.MediaTypeImageLayerZstd
+		case "uncompressed":
+			gw = cw
+			mediaType = ocispec.MediaTypeImageLayer
+		default:
+			return nil, errors.Errorf("unsupported compressor type: %s (support: gzip, zstd, uncompressed)", opt.Compressor)
+		}
+
+		uncompressedDgster := digest.SHA256.Digester()
+		pr, pw := io.Pipe()
+
+		go func() {
+			defer pw.Close()
+			if err := Unpack(ctx, ra, pw, opt); err != nil {
+				pw.CloseWithError(errors.Wrap(err, "unpack nydus to tar"))
+			}
+		}()
+
+		compressed := io.MultiWriter(gw, uncompressedDgster.Hash())
+		buffer := bufPool.Get().(*[]byte)
+		defer bufPool.Put(buffer)
+		if _, err = io.CopyBuffer(compressed, pr, *buffer); err != nil {
+			return nil, errors.Wrapf(err, "copy to compressed writer")
+		}
+
+		if gw != cw {
+			if err = gw.Close(); err != nil {
+				return nil, errors.Wrap(err, "close compressor writer")
+			}
+		}
+
+		uncompressedDigest := uncompressedDgster.Digest()
+		compressedDgst := cw.Digest()
+		if err = cw.Commit(ctx, 0, compressedDgst, content.WithLabels(map[string]string{
+			LayerAnnotationUncompressed: uncompressedDigest.String(),
+		})); err != nil {
+			if !errdefs.IsAlreadyExists(err) {
+				return nil, errors.Wrap(err, "commit to content store")
+			}
+		}
+		if err = cw.Close(); err != nil {
+			return nil, errors.Wrap(err, "close content store writer")
+		}
+
+		newDesc, err := makeOCIBlobDesc(ctx, cs, uncompressedDigest, compressedDgst, mediaType)
+		if err != nil {
+			return nil, err
+		}
+
+		if opt.Backend != nil {
+			if err := opt.Backend.Push(ctx, cs, *newDesc); err != nil {
+				return nil, errors.Wrap(err, "push to storage backend")
+			}
+		}
+		return newDesc, nil
 	}
 }
